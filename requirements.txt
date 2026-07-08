@@ -4,3 +4,5 @@ llama-index-embeddings-google-genai
 streamlit
 requests
 python-dotenv
+streamlit-mic-recorder
+gTTS

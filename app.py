@@ -4,18 +4,26 @@ app.py
 The main app. It does three things:
   1. Searches trusted medical sources (PubMed, Europe PMC, ClinicalTrials.gov).
   2. Feeds the results to the AI, which reads them and writes a cited answer (RAG).
-  3. Shows everything in a simple web page (Streamlit).
+  3. Shows everything in a simple web page (Streamlit) - with an optional voicebot:
+     you can SPEAK your question and HEAR the answer read back.
 
 To run it, open a terminal in this folder and type:
     streamlit run app.py
 """
 
+import io
 import os
 
 import streamlit as st
 from dotenv import load_dotenv
 
-# The three source helpers. Each one takes a question and returns a list of
+# Voice features (both free):
+#   speech_to_text -> turns your spoken question into text (microphone)
+#   gTTS           -> turns the answer into spoken audio (read aloud)
+from streamlit_mic_recorder import speech_to_text
+from gtts import gTTS
+
+# The three source helpers. Each takes a question and returns a list of
 # results in the same shape: title, abstract, url, source.
 from pubmed import search_pubmed
 from europepmc import search_europepmc
@@ -31,7 +39,6 @@ from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 load_dotenv()
 
 # On Streamlit Cloud the key is stored in "Secrets" instead of a .env file.
-# This copies it into place so the app works both locally and online.
 try:
     if "GOOGLE_API_KEY" in st.secrets:
         os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
@@ -58,10 +65,23 @@ def setup_ai():
 
 
 # ---------------------------------------------------------------------------
+# Turn the answer text into spoken audio (returns MP3 bytes, or None on error).
+# ---------------------------------------------------------------------------
+def text_to_speech(text):
+    try:
+        # gTTS has a length limit per call, so trim very long answers for audio.
+        speech = gTTS(text=text[:3000], lang="en")
+        buffer = io.BytesIO()
+        speech.write_to_fp(buffer)
+        return buffer.getvalue()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # The core work: search the chosen sources, then have the AI answer using them.
 # ---------------------------------------------------------------------------
 def research(question, per_source, sources):
-    # 1. Gather results from every selected source.
     all_articles = []
     errors = []
     for name in sources:
@@ -77,8 +97,6 @@ def research(question, per_source, sources):
     if not all_articles:
         return None, [], errors
 
-    # 2. Turn each result into a "Document" the AI can read. We include the
-    #    source name so the AI knows where each piece of evidence came from.
     documents = [
         Document(
             text=f"Source: {a['source']}\nTitle: {a['title']}\n\n{a['abstract']}",
@@ -87,8 +105,6 @@ def research(question, per_source, sources):
         for a in all_articles
     ]
 
-    # 3. Build a searchable index and ask the question.
-    #    The instruction keeps the AI honest: use only the sources given.
     index = VectorStoreIndex.from_documents(documents)
     query_engine = index.as_query_engine(similarity_top_k=len(all_articles))
 
@@ -124,9 +140,24 @@ if not os.getenv("GOOGLE_API_KEY") or "paste-your-key" in os.getenv("GOOGLE_API_
 
 setup_ai()
 
-# The question box, a source picker, and a slider for how many results.
+# --- Ask by voice (microphone) ---------------------------------------------
+st.write("Type your question, or tap the mic to ask by voice:")
+spoken = speech_to_text(
+    language="en",
+    start_prompt="Speak question",
+    stop_prompt="Stop",
+    just_once=True,
+    use_container_width=False,
+    key="stt",
+)
+# If something was spoken, put it into the question box.
+if spoken:
+    st.session_state["question"] = spoken
+
+# --- Ask by typing ---------------------------------------------------------
 question = st.text_input(
     "Your medical question",
+    key="question",
     placeholder="e.g. What is the first-line treatment for type 2 diabetes in adults?",
 )
 sources = st.multiselect(
@@ -135,6 +166,7 @@ sources = st.multiselect(
     default=list(SOURCE_FUNCS.keys()),
 )
 per_source = st.slider("How many results per source", 3, 10, 5)
+read_aloud = st.checkbox("Read the answer aloud", value=True)
 
 if st.button("Search", type="primary") and question:
     if not sources:
@@ -148,7 +180,6 @@ if st.button("Search", type="primary") and question:
             st.error(f"Something went wrong: {error}")
             st.stop()
 
-    # Let the user know if any single source failed (the rest still worked).
     for message in errors:
         st.caption(f"Note: {message}")
 
@@ -159,7 +190,13 @@ if st.button("Search", type="primary") and question:
         st.subheader("Summary")
         st.write(answer)
 
-        # Show the sources it read, grouped with a source label.
+        # Read the answer aloud, if enabled.
+        if read_aloud:
+            audio = text_to_speech(answer)
+            if audio:
+                st.audio(audio, format="audio/mp3")
+
+        # Show the sources it read, with a source label.
         st.subheader("Sources")
         for i, a in enumerate(articles, start=1):
             st.markdown(f"**{i}. [{a['title']}]({a['url']})**  \n*{a['source']}*")
